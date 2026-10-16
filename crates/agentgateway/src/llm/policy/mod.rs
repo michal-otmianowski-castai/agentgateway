@@ -444,7 +444,11 @@ enum RequestGuardMutation {
 
 enum ResponseGuardMutation {
 	Texts(TextReplacements),
-	Choices(Vec<webhook::ResponseChoice>),
+	/// Webhook choices, in the shape `to_webhook_choices(include_tool_calls)` produced.
+	Choices {
+		choices: Vec<webhook::ResponseChoice>,
+		include_tool_calls: bool,
+	},
 }
 
 /// A streaming guardrail evaluator. Each guard kind gets one stateless implementation
@@ -488,16 +492,22 @@ impl crate::llm::ResponseType for TextResponse {
 		}
 	}
 
-	fn to_webhook_choices(&self) -> Vec<webhook::ResponseChoice> {
+	fn to_webhook_choices(&self, _include_tool_calls: bool) -> Vec<webhook::ResponseChoice> {
+		// A streamed text window carries no tool calls.
 		vec![webhook::ResponseChoice {
 			message: crate::llm::SimpleChatCompletionMessage {
 				role: "assistant".into(),
 				content: self.content.clone().into(),
 			},
+			tool_calls: None,
 		}]
 	}
 
-	fn set_webhook_choices(&mut self, resp: Vec<webhook::ResponseChoice>) -> anyhow::Result<()> {
+	fn set_webhook_choices(
+		&mut self,
+		resp: Vec<webhook::ResponseChoice>,
+		_include_tool_calls: bool,
+	) -> anyhow::Result<()> {
 		if let Some(choice) = resp.into_iter().next() {
 			self.content = choice.message.content.to_string();
 		}
@@ -505,7 +515,7 @@ impl crate::llm::ResponseType for TextResponse {
 	}
 
 	fn serialize(&self) -> serde_json::Result<Vec<u8>> {
-		serde_json::to_vec(&self.to_webhook_choices())
+		serde_json::to_vec(&self.to_webhook_choices(false))
 	}
 
 	fn visit_text_mut(&mut self, f: &mut dyn FnMut(crate::llm::ResponseText, &mut String)) {
@@ -969,7 +979,10 @@ impl Policy {
 						return Ok(Some(rejection.as_response()));
 					}
 				},
-				ResponseGuardMutation::Choices(choices) => resp.set_webhook_choices(choices)?,
+				ResponseGuardMutation::Choices {
+					choices,
+					include_tool_calls,
+				} => resp.set_webhook_choices(choices, include_tool_calls)?,
 			}
 			Ok(None)
 		})
@@ -1702,9 +1715,14 @@ impl Policy {
 		http_headers: &HeaderMap,
 		client: &PolicyClient,
 		webhook: &Webhook,
+		include_tool_calls: bool,
 		original: Option<&cel::RequestSnapshot>,
+		rejection: &RequestRejection,
 	) -> anyhow::Result<(GuardrailOutcome<ResponseGuardMutation>, Option<GuardDetail>)> {
-		let messages = resp.to_webhook_choices();
+		let messages = resp.to_webhook_choices(include_tool_calls);
+		// Only choices that carry tool calls need comparing with the Mask that comes back.
+		let sent = (include_tool_calls && messages.iter().any(|c| c.tool_calls.is_some()))
+			.then(|| messages.clone());
 		let headers = Self::get_webhook_forward_headers(http_headers, &webhook.forward_header_matches);
 		let whr = webhook::send_response(
 			client,
@@ -1714,8 +1732,16 @@ impl Policy {
 			messages,
 		)
 		.await?;
+		// Tool calls cannot be rewritten: applying such a Mask would change the text only and let
+		// the original calls through, so it is enforced as a rejection instead.
+		let mask_alters_tool_calls = matches!(
+			&whr.action,
+			ResponseAction::Mask(mask)
+				if sent.as_deref().is_some_and(|sent| Self::mask_alters_tool_calls(sent, &mask.body))
+		);
 		if webhook.action == RejectAuditAction::Audit {
 			let (would_action, reason) = match whr.action {
+				ResponseAction::Mask(m) if mask_alters_tool_calls => ("reject", m.reason),
 				ResponseAction::Mask(m) => ("mask", m.reason),
 				ResponseAction::Reject(r) => ("reject", r.reason),
 				ResponseAction::Pass(_) => return Ok((GuardrailOutcome::None, None)),
@@ -1729,11 +1755,60 @@ impl Policy {
 				}),
 			));
 		}
-		Self::webhook_response_outcome(whr.action)
+		if let ResponseAction::Mask(mask) = &whr.action
+			&& mask_alters_tool_calls
+		{
+			warn!(
+				"webhook mask changed tool calls, which cannot be rewritten; rejecting response: {}",
+				mask.reason.as_deref().unwrap_or("no reason specified")
+			);
+			return Ok((
+				GuardrailOutcome::Rejected(rejection.as_response()),
+				Some(GuardDetail {
+					action_reason: mask.reason.clone(),
+					..Default::default()
+				}),
+			));
+		}
+		Self::webhook_response_outcome(whr.action, include_tool_calls)
+	}
+
+	/// Whether a webhook Mask returns tool calls that differ from the ones it was sent. Omitted
+	/// `tool_calls` mean "unchanged" (webhooks predating tool-call support never echo them);
+	/// returning a different number of choices when tool calls were sent counts as a change.
+	/// A webhook that was never sent tool calls cannot meaningfully alter them: echoed tool
+	/// calls are ignored entirely, matching the behavior before they existed in this payload.
+	fn mask_alters_tool_calls(sent: &[webhook::ResponseChoice], body: &MaskActionBody) -> bool {
+		let MaskActionBody::ResponseChoices(body) = body else {
+			// Rejected as an invalid body by `webhook_response_outcome`.
+			return false;
+		};
+		fn sent_tool_calls(choice: &webhook::ResponseChoice) -> &[agent_llm::ToolCall] {
+			choice.tool_calls.as_deref().unwrap_or_default()
+		}
+		if !sent.iter().any(|c| !sent_tool_calls(c).is_empty()) {
+			return false;
+		}
+		if body.choices.len() != sent.len() {
+			return true;
+		}
+		sent.iter().zip(&body.choices).any(|(sent, returned)| {
+			let Some(returned) = &returned.tool_calls else {
+				return false;
+			};
+			let sent = sent_tool_calls(sent);
+			sent.len() != returned.len()
+				|| sent.iter().zip(returned).any(|(s, r)| {
+					(!r.id.is_empty() && s.id != r.id)
+						|| s.name != r.name
+						|| !echoed_arguments_match(&s.arguments, &r.arguments)
+				})
+		})
 	}
 
 	fn webhook_response_outcome(
 		action: ResponseAction,
+		include_tool_calls: bool,
 	) -> anyhow::Result<(GuardrailOutcome<ResponseGuardMutation>, Option<GuardDetail>)> {
 		match action {
 			ResponseAction::Mask(mask) => {
@@ -1745,7 +1820,10 @@ impl Policy {
 					anyhow::bail!("invalid webhook response");
 				};
 				Ok((
-					GuardrailOutcome::Masked(ResponseGuardMutation::Choices(body.choices)),
+					GuardrailOutcome::Masked(ResponseGuardMutation::Choices {
+						choices: body.choices,
+						include_tool_calls,
+					}),
 					Some(GuardDetail {
 						action_reason: mask.reason,
 						..Default::default()
@@ -2009,7 +2087,16 @@ impl Policy {
 				None,
 			)),
 			ResponseGuardKind::Webhook(wh) => {
-				Self::evaluate_webhook_response(resp, http_headers, client, wh, original).await
+				Self::evaluate_webhook_response(
+					resp,
+					http_headers,
+					client,
+					wh,
+					guard.inspects_tool_calls(),
+					original,
+					&guard.rejection,
+				)
+				.await
 			},
 			ResponseGuardKind::BedrockGuardrails(bg) => {
 				Self::evaluate_bedrock_guardrails_response(
@@ -2045,6 +2132,33 @@ impl Policy {
 				.await
 			},
 		}
+	}
+}
+
+/// Whether tool-call arguments a webhook echoed back are the ones it was sent. Echoes may be
+/// stringified (OpenAI style) and may round numbers — JSON parsers that read every number as
+/// a double, such as JavaScript's, do — neither of which changes the call.
+fn echoed_arguments_match(sent: &serde_json::Value, echoed: &serde_json::Value) -> bool {
+	json_eq_numeric(sent, echoed)
+		|| matches!(echoed, serde_json::Value::String(raw)
+			if json_eq_numeric(sent, &agent_llm::types::parse_tool_call_arguments(raw)))
+}
+
+/// JSON equality that compares numbers by their value as a double.
+fn json_eq_numeric(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+	use serde_json::Value;
+	match (a, b) {
+		(Value::Number(a), Value::Number(b)) => a == b || a.as_f64() == b.as_f64(),
+		(Value::Array(a), Value::Array(b)) => {
+			a.len() == b.len() && a.iter().zip(b).all(|(a, b)| json_eq_numeric(a, b))
+		},
+		(Value::Object(a), Value::Object(b)) => {
+			a.len() == b.len()
+				&& a
+					.iter()
+					.all(|(key, a)| b.get(key).is_some_and(|b| json_eq_numeric(a, b)))
+		},
+		_ => a == b,
 	}
 }
 
@@ -2518,16 +2632,33 @@ fn de_response_scope<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ResponseGuard {
-	/// Webhooks always inspect messages; other guards walk scoped response text.
+	/// Webhooks always inspect messages and may additionally opt into tool calls with
+	/// `[messages, toolInput]`; the scope must list `messages` so it says what the webhook
+	/// actually receives. Every other guard kind walks scoped response text.
 	pub(crate) fn validate_scope(&self) -> Result<(), String> {
-		if !matches!(self.kind, ResponseGuardKind::Webhook(_)) || self.scope == default_response_scope()
-		{
-			return Ok(());
+		match &self.kind {
+			ResponseGuardKind::Webhook(_)
+				if self.scope.contains(&ContentScope::Messages)
+					&& self
+						.scope
+						.iter()
+						.all(|s| matches!(s, ContentScope::Messages | ContentScope::ToolInput)) =>
+			{
+				Ok(())
+			},
+			ResponseGuardKind::Webhook(_) => Err(
+				"scope: webhook response guards always inspect messages; use [messages] or [messages, toolInput]"
+					.to_string(),
+			),
+			_ => Ok(()),
 		}
-		Err(
-			"scope: webhook response guards do not support a non-default scope; they always inspect messages"
-				.into(),
-		)
+	}
+
+	/// Only webhooks receive tool calls (`ResponseChoice::tool_calls`), and only when they
+	/// opt in via the `toolInput` scope; every other guard kind inspects text alone.
+	pub(crate) fn inspects_tool_calls(&self) -> bool {
+		matches!(self.kind, ResponseGuardKind::Webhook(_))
+			&& self.scope.contains(&ContentScope::ToolInput)
 	}
 
 	fn failure_mode(&self) -> FailureMode {

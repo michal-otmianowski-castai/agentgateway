@@ -699,13 +699,17 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn to_webhook_choices(&self) -> Vec<ResponseChoice> {
+	fn to_webhook_choices(&self, _include_tool_calls: bool) -> Vec<ResponseChoice> {
 		unimplemented!(
 			"to_webhook_choices is used for prompt guard; prompt guard is disabled for detect."
 		)
 	}
 
-	fn set_webhook_choices(&mut self, _resp: Vec<ResponseChoice>) -> anyhow::Result<()> {
+	fn set_webhook_choices(
+		&mut self,
+		_resp: Vec<ResponseChoice>,
+		_include_tool_calls: bool,
+	) -> anyhow::Result<()> {
 		unimplemented!(
 			"set_webhook_choices is used for prompt guard; prompt guard is disabled for detect."
 		)

@@ -621,7 +621,7 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn to_webhook_choices(&self) -> Vec<webhook::ResponseChoice> {
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<webhook::ResponseChoice> {
 		self
 			.0
 			.candidates
@@ -631,11 +631,19 @@ impl ResponseType for Response {
 					role: strng::literal!("assistant"),
 					content: strng::new(c.content.as_ref().map(candidate_text).unwrap_or_default()),
 				},
+				tool_calls: include_tool_calls
+					.then(|| candidate_tool_calls(c.content.as_ref()))
+					.flatten(),
 			})
 			.collect()
 	}
 
-	fn set_webhook_choices(&mut self, choices: Vec<webhook::ResponseChoice>) -> anyhow::Result<()> {
+	fn set_webhook_choices(
+		&mut self,
+		choices: Vec<webhook::ResponseChoice>,
+		_include_tool_calls: bool,
+	) -> anyhow::Result<()> {
+		// One choice per candidate in either shape: tool calls ride along on it.
 		if self.0.candidates.len() != choices.len() {
 			anyhow::bail!("webhook response message count mismatch");
 		}
@@ -668,6 +676,44 @@ impl ResponseType for Response {
 			}
 		}
 	}
+}
+
+/// Tool invocations of a candidate, as surfaced to guardrail webhooks. Function calls carry
+/// their name and arguments. Built-in tool calls are named by their tool type (`toolCall`
+/// parts, e.g. `GOOGLE_SEARCH_WEB`) or as `executableCode` (code execution), and carry their
+/// arguments or, without any, the whole call; their results (`toolResponse`,
+/// `codeExecutionResult`) are not tool calls.
+fn candidate_tool_calls(content: Option<&vg::Content>) -> Option<Vec<crate::ToolCall>> {
+	let str_field = |value: &serde_json::Value, key: &str| {
+		value
+			.get(key)
+			.and_then(serde_json::Value::as_str)
+			.filter(|s| !s.is_empty())
+			.map(strng::new)
+	};
+	let tool_calls: Vec<_> = content?
+		.parts
+		.iter()
+		.filter_map(|p| match p {
+			vg::Part::FunctionCall(fc) => Some(crate::ToolCall {
+				id: strng::new(fc.function_call.id.as_deref().unwrap_or_default()),
+				name: strng::new(&fc.function_call.name),
+				arguments: fc.function_call.args.clone(),
+			}),
+			vg::Part::ToolCall(tc) => Some(crate::ToolCall {
+				id: str_field(&tc.tool_call, "id").unwrap_or_default(),
+				name: str_field(&tc.tool_call, "toolType").unwrap_or_else(|| strng::literal!("toolCall")),
+				arguments: tc.tool_call.get("args").unwrap_or(&tc.tool_call).clone(),
+			}),
+			vg::Part::ExecutableCode(code) => Some(crate::ToolCall {
+				id: str_field(&code.executable_code, "id").unwrap_or_default(),
+				name: strng::literal!("executableCode"),
+				arguments: code.executable_code.clone(),
+			}),
+			_ => None,
+		})
+		.collect();
+	(!tool_calls.is_empty()).then_some(tool_calls)
 }
 
 /// Visible (non-thought) text of a candidate, concatenated like the OpenAI translation does.
@@ -819,6 +865,73 @@ mod tests {
 
 	fn request(body: serde_json::Value) -> Request {
 		serde_json::from_value(body).expect("valid request")
+	}
+
+	#[test]
+	fn webhook_choices_include_function_call_parts() {
+		let response: super::Response = serde_json::from_value(json!({
+			"candidates": [{
+				"content": {
+					"role": "model",
+					"parts": [
+						{ "text": "Calling the tool." },
+						{ "functionCall": { "id": "fc-1", "name": "get_weather", "args": {"city": "SF"} } }
+					]
+				}
+			}]
+		}))
+		.expect("response parses");
+
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 1);
+		assert_eq!(choices[0].message.content.as_str(), "Calling the tool.");
+		let tool_calls = choices[0]
+			.tool_calls
+			.as_deref()
+			.expect("function call parts should reach the webhook");
+		assert_eq!(tool_calls.len(), 1);
+		assert_eq!(tool_calls[0].id.as_str(), "fc-1");
+		assert_eq!(tool_calls[0].name.as_str(), "get_weather");
+		assert_eq!(tool_calls[0].arguments, json!({"city": "SF"}));
+	}
+
+	#[test]
+	fn webhook_choices_include_builtin_tool_call_parts_without_results() {
+		let response: super::Response = serde_json::from_value(json!({
+			"candidates": [{
+				"content": {
+					"role": "model",
+					"parts": [
+						{ "executableCode": { "language": "PYTHON", "code": "print(1)" } },
+						{ "codeExecutionResult": { "outcome": "OUTCOME_OK", "output": "1" } },
+						{ "toolCall": { "id": "search", "toolType": "GOOGLE_SEARCH_WEB", "args": { "query": "q" } } },
+						{ "toolResponse": { "id": "search", "toolType": "GOOGLE_SEARCH_WEB", "response": {} } },
+						{ "text": "done" }
+					]
+				}
+			}]
+		}))
+		.expect("response parses");
+
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 1);
+		assert_eq!(choices[0].message.content.as_str(), "done");
+		let tool_calls = choices[0]
+			.tool_calls
+			.as_deref()
+			.expect("built-in tool calls should reach the webhook");
+		assert_eq!(tool_calls.len(), 2, "results are not tool calls");
+		assert_eq!(tool_calls[0].id.as_str(), "");
+		assert_eq!(tool_calls[0].name.as_str(), "executableCode");
+		assert_eq!(
+			tool_calls[0].arguments,
+			json!({"language": "PYTHON", "code": "print(1)"})
+		);
+		assert_eq!(tool_calls[1].id.as_str(), "search");
+		assert_eq!(tool_calls[1].name.as_str(), "GOOGLE_SEARCH_WEB");
+		assert_eq!(tool_calls[1].arguments, json!({"query": "q"}));
 	}
 
 	#[test]
@@ -1055,9 +1168,11 @@ mod tests {
 				"finishReason": "STOP"
 			}]
 		}));
-		let mut choices = resp.to_webhook_choices();
+		let mut choices = resp.to_webhook_choices(true);
 		choices[0].message.content = "".into();
-		resp.set_webhook_choices(choices).expect("set choices");
+		resp
+			.set_webhook_choices(choices, true)
+			.expect("set choices");
 
 		let out: serde_json::Value =
 			serde_json::from_slice(&ResponseType::serialize(&resp).expect("serialize")).unwrap();
@@ -1078,9 +1193,11 @@ mod tests {
 				"finishReason": "STOP"
 			}]
 		}));
-		let mut choices = resp.to_webhook_choices();
+		let mut choices = resp.to_webhook_choices(true);
 		choices[0].message.content = "".into();
-		resp.set_webhook_choices(choices).expect("set choices");
+		resp
+			.set_webhook_choices(choices, true)
+			.expect("set choices");
 
 		let out: serde_json::Value =
 			serde_json::from_slice(&ResponseType::serialize(&resp).expect("serialize")).unwrap();
@@ -1239,11 +1356,13 @@ mod tests {
 				"finishReason": "STOP"
 			}]
 		}));
-		let mut choices = resp.to_webhook_choices();
+		let mut choices = resp.to_webhook_choices(true);
 		assert_eq!(choices.len(), 1);
 		assert_eq!(choices[0].message.content, "secret answer");
 		choices[0].message.content = strng::literal!("MASKED");
-		resp.set_webhook_choices(choices).expect("set choices");
+		resp
+			.set_webhook_choices(choices, true)
+			.expect("set choices");
 
 		let parts = &resp.0.candidates[0].content.as_ref().unwrap().parts;
 		assert_eq!(parts.len(), 3);
@@ -1269,10 +1388,12 @@ mod tests {
 			]
 		});
 		let mut resp = response(body.clone());
-		let mut choices = resp.to_webhook_choices();
+		let mut choices = resp.to_webhook_choices(true);
 		assert_eq!(choices[1].message.content, "");
 		choices[0].message.content = strng::literal!("MASKED");
-		resp.set_webhook_choices(choices).expect("set choices");
+		resp
+			.set_webhook_choices(choices, true)
+			.expect("set choices");
 
 		let out: serde_json::Value =
 			serde_json::from_slice(&ResponseType::serialize(&resp).expect("serialize")).unwrap();

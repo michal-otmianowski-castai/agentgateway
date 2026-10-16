@@ -4527,7 +4527,7 @@ mod tests {
 		let err = convert_backend_ai_policy(&ai, &mut Diagnostics::default()).unwrap_err();
 		assert!(err.to_string().contains("do not support scope"), "{err}");
 
-		// response guards: regex can opt in to tool calls, webhook cannot
+		// response guards: regex can opt in to tool calls, webhook only alongside messages
 		let convert_response_guard = |kind, scope| {
 			let ai = Ai {
 				prompt_guard: Some(proto::agent::backend_policy_spec::ai::PromptGuard {
@@ -4551,12 +4551,18 @@ mod tests {
 			policy.prompt_guard.unwrap().response[0].scope,
 			vec![llm::ContentScope::Messages, llm::ContentScope::ToolInput]
 		);
+		let policy = convert_response_guard(
+			response_guard::Kind::Webhook(Default::default()),
+			vec![ProtoScope::Messages as i32, ProtoScope::ToolInput as i32],
+		)
+		.unwrap();
+		assert!(policy.prompt_guard.unwrap().response[0].inspects_tool_calls());
 		let err = convert_response_guard(
 			response_guard::Kind::Webhook(Default::default()),
 			vec![ProtoScope::ToolInput as i32],
 		)
 		.unwrap_err();
-		assert!(err.to_string().contains("non-default scope"), "{err}");
+		assert!(err.to_string().contains("[messages, toolInput]"), "{err}");
 	}
 
 	#[test]

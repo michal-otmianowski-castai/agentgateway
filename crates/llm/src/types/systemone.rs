@@ -84,13 +84,14 @@ impl crate::types::ResponseType for Response {
 		}
 	}
 
-	fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice> {
+	fn to_webhook_choices(&self, _include_tool_calls: bool) -> Vec<crate::webhook::ResponseChoice> {
 		vec![]
 	}
 
 	fn set_webhook_choices(
 		&mut self,
 		_resp: Vec<crate::webhook::ResponseChoice>,
+		_include_tool_calls: bool,
 	) -> anyhow::Result<()> {
 		Ok(())
 	}

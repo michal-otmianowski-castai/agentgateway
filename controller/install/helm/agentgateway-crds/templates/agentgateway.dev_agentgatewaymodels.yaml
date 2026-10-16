@@ -4956,10 +4956,12 @@ spec:
                               type: object
                           type: object
                           x-kubernetes-validations:
-                          - message: 'scope: webhook guards do not support a non-default
-                              scope; they always inspect the default (Messages)'
+                          - message: 'scope: webhook guards accept the default [Messages]
+                              or [Messages, ToolInput]; they always inspect messages'
                             rule: '!has(self.scope) || !has(self.webhook) || (self.scope.size()
-                              == 1 && ''Messages'' in self.scope)'
+                              == 1 && ''Messages'' in self.scope) || (self.scope.size()
+                              == 2 && ''Messages'' in self.scope && ''ToolInput''
+                              in self.scope)'
                           - message: exactly one of the fields in [regex webhook bedrockGuardrails
                               googleModelArmor] must be set
                             rule: (has(self.regex)?1:0)+(has(self.webhook)?1:0)+(has(self.bedrockGuardrails)?1:0)+(has(self.googleModelArmor)?1:0)

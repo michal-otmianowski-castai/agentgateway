@@ -134,6 +134,90 @@ pub mod webhook {
 	pub struct ResponseChoice {
 		/// message contains the role and text content of the response from the LLM model.
 		pub message: Message,
+		/// tool_calls contains the tool/function invocations in this response choice, with
+		/// arguments normalized to JSON. Omitted when the choice has no tool calls, and only
+		/// ever sent to webhooks that opted into tool-call inspection. Webhook servers receive
+		/// them for inspection but cannot rewrite them: Mask only rewrites `message.content`,
+		/// and a Mask that returns different tool calls is treated as a rejection. Omitting
+		/// them from a Mask leaves them unchanged.
+		#[serde(
+			default,
+			skip_serializing_if = "Option::is_none",
+			deserialize_with = "de_lenient_tool_calls"
+		)]
+		pub tool_calls: Option<Vec<crate::ToolCall>>,
+	}
+
+	/// Webhook servers may echo tool calls in a looser shape than we send: extra fields such as
+	/// `type`, a missing `id`, or OpenAI-style stringified `arguments`. Accept any shape rather
+	/// than failing the whole Mask body, which the untagged `ResponseAction` parsing would
+	/// otherwise silently downgrade to a Pass. `arguments` are kept as echoed; comparing them
+	/// with the ones sent is up to the caller.
+	fn de_lenient_tool_calls<'de, D: serde::Deserializer<'de>>(
+		deserializer: D,
+	) -> Result<Option<Vec<crate::ToolCall>>, D::Error> {
+		use serde_json::Value;
+
+		let str_field = |call: &Value, key: &str| {
+			agent_core::strng::new(call.get(key).and_then(Value::as_str).unwrap_or_default())
+		};
+		let to_tool_call = |call: Value| crate::ToolCall {
+			id: str_field(&call, "id"),
+			name: str_field(&call, "name"),
+			arguments: match call.get("arguments") {
+				Some(arguments) => arguments.clone(),
+				// Not a tool-call object at all: keep it whole so it never compares equal.
+				None if !call.is_object() => call,
+				None => Value::Null,
+			},
+		};
+		Ok(match Option::<Value>::deserialize(deserializer)? {
+			None | Some(Value::Null) => None,
+			Some(Value::Array(calls)) => Some(calls.into_iter().map(to_tool_call).collect()),
+			Some(other) => Some(vec![to_tool_call(other)]),
+		})
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use serde_json::json;
+
+		use super::*;
+
+		/// The choice payload is the public guardrail webhook API. `crate::ToolCall` is shared with
+		/// observability, so pin its wire shape here: a change made for telemetry must not alter
+		/// what webhook servers receive unnoticed.
+		#[test]
+		fn response_choice_wire_format() {
+			let choice = ResponseChoice {
+				message: Message {
+					role: "assistant".into(),
+					content: "Running it".into(),
+				},
+				tool_calls: Some(vec![crate::ToolCall {
+					id: "call_1".into(),
+					name: "bash".into(),
+					arguments: json!({"cmd": "ls"}),
+				}]),
+			};
+			assert_eq!(
+				serde_json::to_value(&choice).unwrap(),
+				json!({
+					"message": {"role": "assistant", "content": "Running it"},
+					"tool_calls": [{"id": "call_1", "name": "bash", "arguments": {"cmd": "ls"}}],
+				})
+			);
+
+			// Without tool calls, the payload is exactly the shape webhooks always received.
+			let text_only = ResponseChoice {
+				tool_calls: None,
+				..choice
+			};
+			assert_eq!(
+				serde_json::to_value(&text_only).unwrap(),
+				json!({"message": {"role": "assistant", "content": "Running it"}})
+			);
+		}
 	}
 }
 

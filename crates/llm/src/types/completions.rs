@@ -242,7 +242,12 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn set_webhook_choices(&mut self, choices: Vec<ResponseChoice>) -> anyhow::Result<()> {
+	fn set_webhook_choices(
+		&mut self,
+		choices: Vec<ResponseChoice>,
+		_include_tool_calls: bool,
+	) -> anyhow::Result<()> {
+		// One choice per completion choice in either shape: tool calls ride along on it.
 		if self.choices.len() != choices.len() {
 			anyhow::bail!("webhook response message count mismatch");
 		}
@@ -252,7 +257,7 @@ impl ResponseType for Response {
 		Ok(())
 	}
 
-	fn to_webhook_choices(&self) -> Vec<ResponseChoice> {
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<ResponseChoice> {
 		self
 			.choices
 			.iter()
@@ -261,6 +266,9 @@ impl ResponseType for Response {
 				let content = c.message.content.clone().unwrap_or_default().into();
 				ResponseChoice {
 					message: Message { role, content },
+					tool_calls: include_tool_calls
+						.then(|| tool_calls_from_message_rest(&c.message.rest))
+						.flatten(),
 				}
 			})
 			.collect()
@@ -343,6 +351,30 @@ fn visit_reasoning_text(
 	}
 }
 
+fn tool_calls_from_message_rest(rest: &serde_json::Value) -> Option<Vec<crate::ToolCall>> {
+	let calls = rest.get("tool_calls")?.as_array()?;
+	let tool_calls: Vec<_> = calls
+		.iter()
+		.filter_map(|tc| {
+			let function = tc.get("function")?;
+			Some(crate::ToolCall {
+				id: tc
+					.get("id")
+					.and_then(|v| v.as_str())
+					.map(strng::new)
+					.unwrap_or_default(),
+				name: strng::new(function.get("name")?.as_str()?),
+				arguments: function
+					.get("arguments")
+					.and_then(|v| v.as_str())
+					.map(crate::types::parse_tool_call_arguments)
+					.unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+			})
+		})
+		.collect();
+	(!tool_calls.is_empty()).then_some(tool_calls)
+}
+
 fn extract_output_messages(choices: &[Choice]) -> Option<Vec<OutputMessage>> {
 	let messages: Vec<OutputMessage> = choices
 		.iter()
@@ -366,11 +398,7 @@ fn extract_output_messages(choices: &[Choice]) -> Option<Vec<OutputMessage>> {
 						let arguments = function
 							.get("arguments")
 							.and_then(|v| v.as_str())
-							.map(|s| match serde_json::from_str(s) {
-								Ok(arguments) => arguments,
-								Err(_) if s.trim().is_empty() => serde_json::Value::Object(Default::default()),
-								Err(_) => serde_json::Value::String(s.to_owned()),
-							})
+							.map(crate::types::parse_tool_call_arguments)
 							.unwrap_or(serde_json::Value::Object(Default::default()));
 
 						content.push(OutputMessagePart::ToolCall {
@@ -1450,6 +1478,99 @@ mod tests {
 		);
 		assert_eq!(tool_calls[1].id.as_str(), "call_2");
 		assert_eq!(tool_calls[1].name.as_str(), "func_b");
+	}
+
+	#[test]
+	fn test_to_webhook_choices_includes_tool_calls() {
+		let json_str = r#"{
+			"id": "chatcmpl-test",
+			"object": "chat.completion",
+			"created": 1000000000,
+			"model": "gpt-4",
+			"choices": [
+				{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": null,
+						"tool_calls": [
+							{
+								"id": "call_1",
+								"type": "function",
+								"function": {
+									"name": "get_weather",
+									"arguments": "{\"location\": \"San Francisco\"}"
+								}
+							}
+						]
+					},
+					"finish_reason": "tool_calls"
+				}
+			],
+			"usage": {
+				"prompt_tokens": 10,
+				"completion_tokens": 5,
+				"total_tokens": 15
+			}
+		}"#;
+
+		let response: Response = serde_json::from_str(json_str).expect("Failed to parse JSON");
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 1);
+		let tool_calls = choices[0]
+			.tool_calls
+			.as_deref()
+			.expect("tool calls should reach the webhook");
+		assert_eq!(tool_calls.len(), 1);
+		assert_eq!(tool_calls[0].id.as_str(), "call_1");
+		assert_eq!(tool_calls[0].name.as_str(), "get_weather");
+		assert_eq!(
+			tool_calls[0].arguments,
+			serde_json::json!({"location": "San Francisco"})
+		);
+	}
+
+	#[test]
+	fn test_to_webhook_choices_excludes_tool_calls_when_not_included() {
+		let json_str = r#"{
+			"id": "chatcmpl-test",
+			"object": "chat.completion",
+			"created": 1000000000,
+			"model": "gpt-4",
+			"choices": [
+				{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": null,
+						"tool_calls": [
+							{
+								"id": "call_1",
+								"type": "function",
+								"function": {
+									"name": "get_weather",
+									"arguments": "{\"location\": \"San Francisco\"}"
+								}
+							}
+						]
+					},
+					"finish_reason": "tool_calls"
+				}
+			],
+			"usage": {
+				"prompt_tokens": 10,
+				"completion_tokens": 5,
+				"total_tokens": 15
+			}
+		}"#;
+
+		let response: Response = serde_json::from_str(json_str).expect("Failed to parse JSON");
+		let choices = response.to_webhook_choices(false);
+
+		// Same choices, same count, tool calls never set: the legacy text-only shape.
+		assert_eq!(choices.len(), 1);
+		assert!(choices[0].tool_calls.is_none());
 	}
 
 	#[test]

@@ -1828,3 +1828,45 @@ spec:
         name: otel-collector
         port: 4317
       path: /v1/traces
+
+---
+_err: 'webhook guards accept the default [Messages] or [Messages, ToolInput]'
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: prompt-guard-webhook-tool-input-without-messages
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: test
+  backend:
+    ai:
+      promptGuard:
+        response:
+        - webhook:
+            backendRef:
+              name: webhook
+              port: 80
+          scope: [ToolInput]
+
+---
+_err: 'webhook guards accept the default [Messages] or [Messages, ToolInput]'
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: prompt-guard-webhook-tool-output
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: test
+  backend:
+    ai:
+      promptGuard:
+        response:
+        - webhook:
+            backendRef:
+              name: webhook
+              port: 80
+          scope: [Messages, ToolOutput]

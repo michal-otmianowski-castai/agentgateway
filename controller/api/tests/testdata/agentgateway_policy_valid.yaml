@@ -1506,3 +1506,23 @@ spec:
         - regex:
             matches: [blocked]
           response: {}
+
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: prompt-guard-webhook-tool-input
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: test
+  backend:
+    ai:
+      promptGuard:
+        response:
+        - webhook:
+            backendRef:
+              name: webhook
+              port: 80
+          scope: [ToolInput, Messages]

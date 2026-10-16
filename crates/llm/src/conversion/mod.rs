@@ -52,15 +52,18 @@ impl<T: crate::types::ResponseType> crate::types::ResponseType for ResponseWithP
 		response
 	}
 
-	fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice> {
-		self.response.to_webhook_choices()
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<crate::webhook::ResponseChoice> {
+		self.response.to_webhook_choices(include_tool_calls)
 	}
 
 	fn set_webhook_choices(
 		&mut self,
 		choices: Vec<crate::webhook::ResponseChoice>,
+		include_tool_calls: bool,
 	) -> anyhow::Result<()> {
-		self.response.set_webhook_choices(choices)
+		self
+			.response
+			.set_webhook_choices(choices, include_tool_calls)
 	}
 
 	fn serialize(&self) -> serde_json::Result<Vec<u8>> {

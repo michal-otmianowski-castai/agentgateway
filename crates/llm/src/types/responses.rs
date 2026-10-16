@@ -1156,14 +1156,12 @@ fn extract_output_messages(resp: &Response) -> Option<Vec<OutputMessage>> {
 	}])
 }
 
-pub(crate) fn output_item_tool_call_part(item: &OutputItem) -> Option<OutputMessagePart> {
+pub(crate) fn output_item_tool_call_fields(
+	item: &OutputItem,
+) -> Option<(Strng, Strng, serde_json::Value)> {
 	let (id, name, arguments) = match item {
 		OutputItem::FunctionCall(call) => {
-			let arguments = match serde_json::from_str(&call.arguments) {
-				Ok(arguments) => arguments,
-				Err(_) if call.arguments.trim().is_empty() => serde_json::Value::Object(Default::default()),
-				Err(_) => serde_json::Value::String(call.arguments.clone()),
-			};
+			let arguments = crate::types::parse_tool_call_arguments(&call.arguments);
 			let name = call
 				.namespace
 				.as_ref()
@@ -1181,18 +1179,117 @@ pub(crate) fn output_item_tool_call_part(item: &OutputItem) -> Option<OutputMess
 			(&call.call_id, name, arguments)
 		},
 		OutputItem::CustomToolCall(call) => {
-			let arguments = match serde_json::from_str(&call.input) {
-				Ok(arguments) => arguments,
-				Err(_) if call.input.trim().is_empty() => serde_json::Value::Object(Default::default()),
-				Err(_) => serde_json::Value::String(call.input.clone()),
-			};
+			let arguments = crate::types::parse_tool_call_arguments(&call.input);
 			(&call.call_id, call.name.clone(), arguments)
 		},
 		_ => return None,
 	};
+	Some((strng::new(id), strng::new(&name), arguments))
+}
+
+/// Whether a Responses output item type is a tool invocation that guardrail webhooks inspect.
+/// Messages, reasoning, and tool results are not; every other type — including types this
+/// gateway does not know yet — is treated as a tool call so new tool kinds are never silently
+/// skipped.
+pub fn output_item_type_is_tool_call(item_type: &str) -> bool {
+	!matches!(
+		item_type,
+		"message" | "reasoning" | "compaction" | "mcp_list_tools" | "additional_tools"
+	) && !item_type.ends_with("_output")
+}
+
+/// Item fields holding a built-in tool's results rather than its inputs.
+const BUILTIN_TOOL_RESULT_FIELDS: &[&str] = &["output", "outputs", "result", "results", "error"];
+
+/// A built-in tool call (shell, apply_patch, computer use, MCP, hosted tools) has no single
+/// argument payload: it is named by its item type and carries the item, without its results,
+/// as arguments.
+fn builtin_tool_call(mut item: Value) -> crate::ToolCall {
+	let str_field = |item: &Value, key: &str| {
+		item
+			.get(key)
+			.and_then(Value::as_str)
+			.filter(|s| !s.is_empty())
+			.map(strng::new)
+	};
+	let id = str_field(&item, "call_id")
+		.or_else(|| str_field(&item, "id"))
+		.unwrap_or_default();
+	let name = str_field(&item, "type").unwrap_or_default();
+	if let Some(fields) = item.as_object_mut() {
+		for field in BUILTIN_TOOL_RESULT_FIELDS {
+			fields.remove(*field);
+		}
+	}
+	crate::ToolCall {
+		id,
+		name,
+		arguments: item,
+	}
+}
+
+/// The tool invocation an output item represents, as surfaced to guardrail webhooks. Function
+/// and custom tool calls carry their (namespaced) name and parsed arguments; built-in tool calls
+/// are named by their item type and carry the item, without its results, as arguments.
+pub fn output_item_webhook_tool_call(item: &OutputItem) -> Option<crate::ToolCall> {
+	match item {
+		OutputItem::FunctionCall(_) | OutputItem::CustomToolCall(_) => {
+			let (id, name, arguments) = output_item_tool_call_fields(item)?;
+			Some(crate::ToolCall {
+				id,
+				name,
+				arguments,
+			})
+		},
+		OutputItem::Message(_) | OutputItem::Reasoning(_) => None,
+		_ => {
+			let item = serde_json::to_value(item).ok()?;
+			output_item_type_is_tool_call(item.get("type")?.as_str()?).then(|| builtin_tool_call(item))
+		},
+	}
+}
+
+/// Like [`output_item_webhook_tool_call`] for an item in raw JSON, as carried by stream events.
+/// An item that does not parse — still in progress, or of a type this gateway does not know —
+/// is mapped from its raw fields, so an unrecognized tool call is surfaced rather than dropped.
+pub fn output_item_value_webhook_tool_call(item: &Value) -> Option<crate::ToolCall> {
+	let item_type = item.get("type")?.as_str()?;
+	if !output_item_type_is_tool_call(item_type) {
+		return None;
+	}
+	if let Ok(parsed) = serde_json::from_value::<OutputItem>(item.clone())
+		&& let Some(call) = output_item_webhook_tool_call(&parsed)
+	{
+		return Some(call);
+	}
+	let mut call = builtin_tool_call(item.clone());
+	let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
+	match item_type {
+		"function_call" => {
+			call.name = match text("namespace") {
+				"" => strng::new(text("name")),
+				namespace => strng::format!(
+					"{namespace}{}{}",
+					crate::conversion::namespace_tools::NAMESPACE_SEPARATOR,
+					text("name")
+				),
+			};
+			call.arguments = crate::types::parse_tool_call_arguments(text("arguments"));
+		},
+		"custom_tool_call" => {
+			call.name = strng::new(text("name"));
+			call.arguments = crate::types::parse_tool_call_arguments(text("input"));
+		},
+		_ => {},
+	}
+	Some(call)
+}
+
+pub(crate) fn output_item_tool_call_part(item: &OutputItem) -> Option<OutputMessagePart> {
+	let (id, name, arguments) = output_item_tool_call_fields(item)?;
 	Some(OutputMessagePart::ToolCall {
-		id: strng::new(id),
-		name: strng::new(&name),
+		id,
+		name,
 		arguments,
 	})
 }
@@ -1275,7 +1372,7 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice> {
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<crate::webhook::ResponseChoice> {
 		self
 			.output
 			.iter()
@@ -1297,9 +1394,20 @@ impl ResponseType for Response {
 							role: "assistant".into(),
 							content: content.into(),
 						},
+						tool_calls: None,
 					})
 				},
-				_ => None, // Ignore non-message outputs (tool calls, reasoning, etc.)
+				_ if include_tool_calls => {
+					let tool_call = output_item_webhook_tool_call(o)?;
+					Some(crate::webhook::ResponseChoice {
+						message: crate::webhook::Message {
+							role: "assistant".into(),
+							content: "".into(),
+						},
+						tool_calls: Some(vec![tool_call]),
+					})
+				},
+				_ => None, // Ignore other outputs (reasoning, tool calls when not included, etc.)
 			})
 			.collect()
 	}
@@ -1307,22 +1415,28 @@ impl ResponseType for Response {
 	fn set_webhook_choices(
 		&mut self,
 		choices: Vec<crate::webhook::ResponseChoice>,
+		include_tool_calls: bool,
 	) -> anyhow::Result<()> {
-		// Filter only Message outputs (ignore tool calls, reasoning, etc.)
-		let message_outputs: Vec<_> = self
-			.output
-			.iter_mut()
-			.filter_map(|o| match o {
-				OutputItem::Message(msg) => Some(msg),
-				_ => None,
-			})
-			.collect();
-
-		if message_outputs.len() != choices.len() {
+		// Choices cover Message items and, when `to_webhook_choices` included them, tool calls,
+		// in output order. The text mask only applies to messages; tool-call choices are not
+		// rewritten.
+		let is_covered_output = |o: &OutputItem| {
+			matches!(o, OutputItem::Message(_))
+				|| (include_tool_calls && output_item_webhook_tool_call(o).is_some())
+		};
+		if self.output.iter().filter(|o| is_covered_output(o)).count() != choices.len() {
 			anyhow::bail!("webhook response message count mismatch");
 		}
 
-		for (msg, wh) in message_outputs.into_iter().zip(choices) {
+		for (output, wh) in self
+			.output
+			.iter_mut()
+			.filter(|o| is_covered_output(o))
+			.zip(choices)
+		{
+			let OutputItem::Message(msg) = output else {
+				continue;
+			};
 			// Replace message content with webhook's modified content
 			msg.content = vec![Content::OutputText(OutputText {
 				annotations: vec![],
@@ -1463,7 +1577,7 @@ pub mod typed {
 
 #[cfg(test)]
 mod tests {
-	use super::typed::{FunctionToolCall, OutputStatus};
+	use super::typed::{AssistantRole, FunctionToolCall, OutputMessage, OutputStatus};
 	use super::*;
 
 	fn response_with_output(output: Vec<OutputItem>) -> Response {
@@ -1510,6 +1624,294 @@ mod tests {
 			"masked input system message"
 		);
 		assert_eq!(input[1].0["role"], "user");
+	}
+
+	#[test]
+	fn webhook_choices_carry_function_call_tool_calls_and_mask_stays_aligned() {
+		let mut response = response_with_output(vec![
+			OutputItem::Message(OutputMessage {
+				content: vec![Content::OutputText(OutputText {
+					text: "calling a tool".to_string(),
+					annotations: vec![],
+					logprobs: None,
+				})],
+				id: "msg_1".to_string(),
+				role: AssistantRole::Assistant,
+				phase: None,
+				status: OutputStatus::Completed,
+			}),
+			OutputItem::FunctionCall(FunctionToolCall {
+				arguments: r#"{"location":"San Francisco"}"#.to_string(),
+				call_id: "call_123".to_string(),
+				namespace: None,
+				name: "get_weather".to_string(),
+				caller: None,
+				id: Some("fc_123".to_string()),
+				status: Some(OutputStatus::Completed),
+				r#async: None,
+			}),
+		]);
+
+		let choices = response.to_webhook_choices(true);
+		assert_eq!(choices.len(), 2);
+		assert!(choices[0].tool_calls.is_none());
+		let calls = choices[1]
+			.tool_calls
+			.as_deref()
+			.expect("function calls should reach the webhook");
+		assert_eq!(calls[0].id.as_str(), "call_123");
+		assert_eq!(calls[0].name.as_str(), "get_weather");
+		assert_eq!(
+			calls[0].arguments,
+			serde_json::json!({"location":"San Francisco"})
+		);
+
+		// Masking must treat tool-call choices as 1:1 pass-through so counts stay aligned
+		response
+			.set_webhook_choices(
+				choices
+					.iter()
+					.map(|c| crate::webhook::ResponseChoice {
+						message: crate::webhook::Message {
+							role: c.message.role.clone(),
+							content: if c.tool_calls.is_some() {
+								c.message.content.clone()
+							} else {
+								"masked prose".into()
+							},
+						},
+						tool_calls: None,
+					})
+					.collect(),
+				true,
+			)
+			.expect("message count matches");
+		let OutputItem::Message(msg) = &response.output[0] else {
+			panic!("message output expected");
+		};
+		let Content::OutputText(text) = &msg.content[0] else {
+			panic!("output text expected");
+		};
+		assert_eq!(text.text, "masked prose");
+	}
+
+	fn output_item(item: serde_json::Value) -> OutputItem {
+		serde_json::from_value(item).expect("output item parses")
+	}
+
+	/// Codex sends `apply_patch` as a freeform custom tool and runs commands through built-in
+	/// shell tools: all of them reach the webhook, built-in calls without their results.
+	#[test]
+	fn webhook_choices_surface_custom_and_builtin_tool_calls() {
+		let mut response = response_with_output(vec![
+			output_item(serde_json::json!({
+				"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_patch",
+				"name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"
+			})),
+			output_item(serde_json::json!({
+				"type": "shell_call", "id": "sh_1", "call_id": "call_sh", "status": "completed",
+				"action": {"commands": ["rm -rf build"]}
+			})),
+			output_item(serde_json::json!({
+				"type": "mcp_call", "id": "mcp_1", "server_label": "github", "name": "create_issue",
+				"arguments": "{\"title\":\"x\"}", "output": "created issue #1"
+			})),
+			output_item(serde_json::json!({
+				"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+				"content": [{"type": "output_text", "text": "done", "annotations": []}]
+			})),
+		]);
+
+		let choices = response.to_webhook_choices(true);
+		assert_eq!(choices.len(), 4);
+		let call = |i: usize| choices[i].tool_calls.as_ref().expect("tool call")[0].clone();
+
+		let patch = call(0);
+		assert_eq!(patch.id.as_str(), "call_patch");
+		assert_eq!(patch.name.as_str(), "apply_patch");
+		assert_eq!(
+			patch.arguments,
+			serde_json::json!("*** Begin Patch\n*** End Patch")
+		);
+
+		let shell = call(1);
+		assert_eq!(shell.id.as_str(), "call_sh");
+		assert_eq!(shell.name.as_str(), "shell_call");
+		assert_eq!(
+			shell.arguments["action"]["commands"],
+			serde_json::json!(["rm -rf build"])
+		);
+
+		let mcp = call(2);
+		assert_eq!(mcp.id.as_str(), "mcp_1");
+		assert_eq!(mcp.name.as_str(), "mcp_call");
+		assert_eq!(mcp.arguments["name"], "create_issue");
+		assert!(
+			mcp.arguments.get("output").is_none(),
+			"tool results are not tool input: {}",
+			mcp.arguments
+		);
+		assert!(choices[3].tool_calls.is_none());
+
+		// Built-in tool choices are 1:1 pass-through on write-back too.
+		let masked = choices
+			.into_iter()
+			.map(|mut choice| {
+				if choice.tool_calls.is_none() {
+					choice.message.content = "masked".into();
+				}
+				choice
+			})
+			.collect();
+		response
+			.set_webhook_choices(masked, true)
+			.expect("choice counts line up");
+		let OutputItem::Message(msg) = &response.output[3] else {
+			panic!("message output expected");
+		};
+		let Content::OutputText(text) = &msg.content[0] else {
+			panic!("output text expected");
+		};
+		assert_eq!(text.text, "masked");
+	}
+
+	#[test]
+	fn output_item_value_tool_calls_fail_safe() {
+		// An in-progress function call without arguments yet keeps its namespaced name.
+		let partial = output_item_value_webhook_tool_call(&serde_json::json!({
+			"type": "function_call", "id": "fc_1", "call_id": "call_1",
+			"namespace": "files", "name": "write"
+		}))
+		.expect("function calls are tool calls");
+		assert_eq!(partial.id.as_str(), "call_1");
+		assert_eq!(partial.name.as_str(), "files__write");
+		assert_eq!(partial.arguments, serde_json::json!({}));
+
+		// Types this gateway does not know are still surfaced, named by their type.
+		let unknown = output_item_value_webhook_tool_call(&serde_json::json!({
+			"type": "future_tool_call", "id": "ftc_1", "target": "prod", "result": "ok"
+		}))
+		.expect("unknown item types fail safe to tool calls");
+		assert_eq!(unknown.id.as_str(), "ftc_1");
+		assert_eq!(unknown.name.as_str(), "future_tool_call");
+		assert_eq!(unknown.arguments["target"], "prod");
+		assert!(unknown.arguments.get("result").is_none());
+
+		for not_a_call in [
+			"message",
+			"reasoning",
+			"function_call_output",
+			"mcp_list_tools",
+		] {
+			assert!(
+				output_item_value_webhook_tool_call(&serde_json::json!({"type": not_a_call})).is_none(),
+				"{not_a_call}"
+			);
+		}
+	}
+
+	#[test]
+	fn webhook_choices_exclude_tool_calls_when_not_included() {
+		let make = || {
+			response_with_output(vec![
+				OutputItem::Message(OutputMessage {
+					content: vec![Content::OutputText(OutputText {
+						text: "calling a tool".to_string(),
+						annotations: vec![],
+						logprobs: None,
+					})],
+					id: "msg_1".to_string(),
+					role: AssistantRole::Assistant,
+					phase: None,
+					status: OutputStatus::Completed,
+				}),
+				OutputItem::FunctionCall(FunctionToolCall {
+					arguments: r#"{"location":"San Francisco"}"#.to_string(),
+					call_id: "call_123".to_string(),
+					namespace: None,
+					name: "get_weather".to_string(),
+					caller: None,
+					id: Some("fc_123".to_string()),
+					status: Some(OutputStatus::Completed),
+					r#async: None,
+				}),
+			])
+		};
+
+		// The legacy shape sees messages only, exactly as before tool calls were surfaced.
+		let mut response = make();
+		let choices = response.to_webhook_choices(false);
+		assert_eq!(choices.len(), 1);
+		assert!(choices[0].tool_calls.is_none());
+		response
+			.set_webhook_choices(
+				vec![crate::webhook::ResponseChoice {
+					message: crate::webhook::Message {
+						role: "assistant".into(),
+						content: "masked prose".into(),
+					},
+					tool_calls: None,
+				}],
+				false,
+			)
+			.expect("message count matches");
+		let OutputItem::Message(msg) = &response.output[0] else {
+			panic!("message output expected");
+		};
+		let Content::OutputText(text) = &msg.content[0] else {
+			panic!("output text expected");
+		};
+		assert_eq!(text.text, "masked prose");
+
+		// The two modes must agree with each other: masking with/without tool-call choices
+		// produces identical serialized responses.
+		let mut with_tool_calls = make();
+		let choices = with_tool_calls.to_webhook_choices(true);
+		assert_eq!(choices.len(), 2);
+		with_tool_calls
+			.set_webhook_choices(
+				choices
+					.iter()
+					.map(|c| crate::webhook::ResponseChoice {
+						message: crate::webhook::Message {
+							role: c.message.role.clone(),
+							content: if c.tool_calls.is_some() {
+								c.message.content.clone()
+							} else {
+								"masked prose".into()
+							},
+						},
+						tool_calls: None,
+					})
+					.collect(),
+				true,
+			)
+			.expect("message count matches");
+		assert_eq!(
+			ResponseType::serialize(&response).unwrap(),
+			ResponseType::serialize(&with_tool_calls).unwrap()
+		);
+
+		// The shape is explicit, not inferred from the count: choices that line up with the
+		// other shape are a mismatch rather than being applied to the wrong items.
+		let masked = |n: usize| {
+			vec![
+				crate::webhook::ResponseChoice {
+					message: crate::webhook::Message {
+						role: "assistant".into(),
+						content: "masked prose".into(),
+					},
+					tool_calls: None,
+				};
+				n
+			]
+		};
+		make()
+			.set_webhook_choices(masked(2), false)
+			.expect_err("two choices for one message");
+		make()
+			.set_webhook_choices(masked(1), true)
+			.expect_err("one choice for a message and a tool call");
 	}
 
 	#[test]

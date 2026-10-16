@@ -867,6 +867,39 @@ impl From<SimpleChatCompletionMessage> for RequestMessage {
 	}
 }
 
+/// Whether an Anthropic content block type is a tool invocation that guardrail webhooks
+/// inspect (`tool_use`, `server_tool_use`, `mcp_tool_use`, ...). Text, thinking, and tool
+/// results are not; every other type — including types this gateway does not know yet — is
+/// treated as a tool call so new tool kinds are never silently skipped.
+pub fn content_block_type_is_tool_call(block_type: &str) -> bool {
+	!matches!(
+		block_type,
+		"text"
+			| "thinking"
+			| "redacted_thinking"
+			| "image"
+			| "document"
+			| "search_result"
+			| "container_upload"
+			| "tool_result"
+	) && !block_type.ends_with("_tool_result")
+}
+
+/// The tool invocation a content block (in raw JSON) represents, as surfaced to guardrail
+/// webhooks: its `input` as arguments, or — for a block without one — the block itself.
+pub fn content_block_webhook_tool_call(block: &serde_json::Value) -> Option<crate::ToolCall> {
+	let block_type = block.get("type")?.as_str()?;
+	if !content_block_type_is_tool_call(block_type) {
+		return None;
+	}
+	let str_field = |key: &str| block.get(key).and_then(|v| v.as_str());
+	Some(crate::ToolCall {
+		id: strng::new(str_field("id").unwrap_or_default()),
+		name: strng::new(str_field("name").unwrap_or(block_type)),
+		arguments: block.get("input").unwrap_or(block).clone(),
+	})
+}
+
 fn extract_output_message(resp: &Response) -> Option<Vec<OutputMessage>> {
 	let mut content = Vec::new();
 
@@ -946,7 +979,12 @@ impl ResponseType for Response {
 		}
 	}
 
-	fn set_webhook_choices(&mut self, choices: Vec<ResponseChoice>) -> anyhow::Result<()> {
+	fn set_webhook_choices(
+		&mut self,
+		choices: Vec<ResponseChoice>,
+		_include_tool_calls: bool,
+	) -> anyhow::Result<()> {
+		// One choice per content block in either shape.
 		if self.content.len() != choices.len() {
 			anyhow::bail!("webhook response message count mismatch");
 		}
@@ -956,7 +994,7 @@ impl ResponseType for Response {
 		Ok(())
 	}
 
-	fn to_webhook_choices(&self) -> Vec<ResponseChoice> {
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<ResponseChoice> {
 		self
 			.content
 			.iter()
@@ -967,6 +1005,9 @@ impl ResponseType for Response {
 						role: "assistant".into(),
 						content: content.into(),
 					},
+					tool_calls: include_tool_calls
+						.then(|| content_block_webhook_tool_call(&c.rest).map(|call| vec![call]))
+						.flatten(),
 				}
 			})
 			.collect()
@@ -1830,7 +1871,9 @@ pub mod typed {
 		fn set_webhook_choices(
 			&mut self,
 			choices: Vec<crate::webhook::ResponseChoice>,
+			_include_tool_calls: bool,
 		) -> anyhow::Result<()> {
+			// One choice per content block in either shape.
 			if self.content.len() != choices.len() {
 				anyhow::bail!("webhook response message count mismatch");
 			}
@@ -1842,7 +1885,7 @@ pub mod typed {
 			Ok(())
 		}
 
-		fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice> {
+		fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<crate::webhook::ResponseChoice> {
 			self
 				.content
 				.iter()
@@ -1851,11 +1894,51 @@ pub mod typed {
 						ContentBlock::Text(t) => t.text.clone(),
 						_ => String::new(),
 					};
+					if !include_tool_calls {
+						return crate::webhook::ResponseChoice {
+							message: crate::webhook::Message {
+								role: "assistant".into(),
+								content: content.into(),
+							},
+							tool_calls: None,
+						};
+					}
+					// Exhaustive so a new block type forces a decision, matching the fail-safe
+					// classification of `content_block_type_is_tool_call`.
+					let tool_calls = match c {
+						ContentBlock::ToolUse {
+							id, name, input, ..
+						}
+						| ContentBlock::ServerToolUse {
+							id, name, input, ..
+						} => Some(vec![crate::ToolCall {
+							id: agent_core::strng::new(id),
+							name: agent_core::strng::new(name),
+							arguments: input.clone(),
+						}]),
+						// The block's type and fields were dropped on parsing, so it cannot be told
+						// apart from a tool call (`mcp_tool_use`, ...): surface it, unnamed, rather
+						// than skip it.
+						ContentBlock::Unknown => Some(vec![crate::ToolCall {
+							id: Default::default(),
+							name: agent_core::strng::literal!("unknown"),
+							arguments: serde_json::Value::Null,
+						}]),
+						ContentBlock::Text(_)
+						| ContentBlock::Image(_)
+						| ContentBlock::Document(_)
+						| ContentBlock::SearchResult(_)
+						| ContentBlock::Thinking { .. }
+						| ContentBlock::RedactedThinking { .. }
+						| ContentBlock::ToolResult { .. }
+						| ContentBlock::WebSearchToolResult { .. } => None,
+					};
 					crate::webhook::ResponseChoice {
 						message: crate::webhook::Message {
 							role: "assistant".into(),
 							content: content.into(),
 						},
+						tool_calls,
 					}
 				})
 				.collect()
@@ -1995,6 +2078,150 @@ mod tests {
 				"claude-sonnet-4-20250514".to_string(),
 			)
 		}
+	}
+
+	#[test]
+	fn untyped_response_webhook_choices_include_tool_use_blocks() {
+		let response: Response = serde_json::from_value(serde_json::json!({
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-sonnet-4-20250514",
+			"content": [
+				{"type": "text", "text": "I'll call the tool."},
+				{"type": "tool_use", "id": "toolu_01A", "name": "get_weather", "input": {"location": "SF"}}
+			],
+			"stop_reason": "tool_use",
+			"usage": {"input_tokens": 100, "output_tokens": 50}
+		}))
+		.expect("response parses");
+
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 2);
+		assert_eq!(choices[0].message.content.as_str(), "I'll call the tool.");
+		assert!(choices[0].tool_calls.is_none());
+		let tool_calls = choices[1]
+			.tool_calls
+			.as_deref()
+			.expect("tool_use block should reach the webhook");
+		assert_eq!(tool_calls[0].id.as_str(), "toolu_01A");
+		assert_eq!(tool_calls[0].name.as_str(), "get_weather");
+		assert_eq!(
+			tool_calls[0].arguments,
+			serde_json::json!({"location": "SF"})
+		);
+	}
+
+	#[test]
+	fn untyped_response_webhook_choices_surface_server_mcp_and_unknown_tool_blocks() {
+		let response: Response = serde_json::from_value(serde_json::json!({
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-sonnet-4-20250514",
+			"content": [
+				{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_fetch", "input": {"url": "https://example.com"}},
+				{"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "content": {}},
+				{"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "create_issue", "server_name": "github", "input": {"title": "x"}},
+				{"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": []},
+				{"type": "future_tool_use", "id": "ftu_1", "target": "prod"},
+				{"type": "text", "text": "done"}
+			],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 100, "output_tokens": 50}
+		}))
+		.expect("response parses");
+
+		let choices = response.to_webhook_choices(true);
+		assert_eq!(choices.len(), 6, "one choice per content block");
+		let calls: Vec<_> = choices
+			.iter()
+			.map(|c| c.tool_calls.as_ref().map(|calls| calls[0].clone()))
+			.collect();
+
+		let fetch = calls[0].as_ref().expect("server tool use is a tool call");
+		assert_eq!(fetch.name.as_str(), "web_fetch");
+		assert_eq!(
+			fetch.arguments,
+			serde_json::json!({"url": "https://example.com"})
+		);
+		assert!(calls[1].is_none(), "tool results are not tool calls");
+		let mcp = calls[2].as_ref().expect("mcp tool use is a tool call");
+		assert_eq!(mcp.id.as_str(), "mcptoolu_1");
+		assert_eq!(mcp.arguments, serde_json::json!({"title": "x"}));
+		assert!(calls[3].is_none(), "tool results are not tool calls");
+		let unknown = calls[4]
+			.as_ref()
+			.expect("unknown block types fail safe to tool calls");
+		assert_eq!(unknown.name.as_str(), "future_tool_use");
+		assert_eq!(unknown.arguments["target"], "prod");
+		assert!(calls[5].is_none());
+		assert_eq!(choices[5].message.content.as_str(), "done");
+	}
+
+	#[test]
+	fn typed_response_webhook_choices_include_tool_use_blocks() {
+		let response = make_typed_response_with_tool_use();
+
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 3);
+		assert!(choices[0].tool_calls.is_none());
+		let first = choices[1]
+			.tool_calls
+			.as_deref()
+			.expect("tool_use block should reach the webhook");
+		assert_eq!(first[0].id.as_str(), "toolu_01A");
+		assert_eq!(
+			first[0].arguments,
+			serde_json::json!({"location": "San Francisco"})
+		);
+		let second = choices[2]
+			.tool_calls
+			.as_deref()
+			.expect("server_tool_use block should reach the webhook");
+		assert_eq!(second[0].name.as_str(), "web_search");
+		assert_eq!(
+			second[0].arguments,
+			serde_json::json!({"query": "rust programming"})
+		);
+	}
+
+	#[test]
+	fn typed_response_webhook_choices_surface_unknown_blocks_but_not_results() {
+		let response = typed::MessagesResponse {
+			content: serde_json::from_value(serde_json::json!([
+				{"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "create_issue", "input": {}},
+				{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1"},
+				{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+			]))
+			.expect("content parses"),
+			..make_typed_response_with_tool_use()
+		};
+
+		let choices = response.to_webhook_choices(true);
+
+		assert_eq!(choices.len(), 3);
+		let unknown = choices[0]
+			.tool_calls
+			.as_deref()
+			.expect("unknown blocks fail safe to tool calls");
+		assert_eq!(unknown[0].name.as_str(), "unknown");
+		assert!(
+			choices[1].tool_calls.is_none(),
+			"tool results are not tool calls"
+		);
+		assert!(
+			choices[2].tool_calls.is_none(),
+			"tool results are not tool calls"
+		);
+		assert!(
+			response
+				.to_webhook_choices(false)
+				.iter()
+				.all(|c| c.tool_calls.is_none())
+		);
 	}
 
 	#[test]

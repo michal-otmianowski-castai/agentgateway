@@ -4186,3 +4186,539 @@ fn bedrock_signed_response_mask_rejects_without_changing_signed_text() {
 		}
 	}
 }
+
+/// A chat completion whose single choice carries `content` and a `bash` tool call running `cmd`.
+fn bash_completion(content: &str, cmd: &str) -> crate::llm::types::completions::Response {
+	let arguments = serde_json::json!({ "cmd": cmd }).to_string();
+	serde_json::from_value(serde_json::json!({
+		"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4",
+		"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+			"role": "assistant", "content": content,
+			"tool_calls": [{"id": "call_1", "type": "function",
+				"function": {"name": "bash", "arguments": arguments}}]
+		}}]
+	}))
+	.unwrap()
+}
+
+/// The single choice of a [`bash_completion`], tool calls included.
+fn bash_completion_choice(
+	resp: &crate::llm::types::completions::Response,
+) -> webhook::ResponseChoice {
+	let mut choices = resp.to_webhook_choices(true);
+	assert_eq!(choices.len(), 1);
+	choices.remove(0)
+}
+
+/// Assert a [`bash_completion`] still has its text replaced by `content` and its original
+/// tool call untouched.
+fn assert_bash_completion(
+	resp: &crate::llm::types::completions::Response,
+	content: &str,
+	cmd: &str,
+	case: &str,
+) {
+	let choice = bash_completion_choice(resp);
+	assert_eq!(choice.message.content.as_str(), content, "{case}");
+	let tool_calls = choice.tool_calls.expect(case);
+	assert_eq!(tool_calls.len(), 1, "{case}");
+	assert_eq!(tool_calls[0].name.as_str(), "bash", "{case}");
+	assert_eq!(
+		tool_calls[0].arguments,
+		serde_json::json!({ "cmd": cmd }),
+		"{case}"
+	);
+}
+
+pub(crate) fn webhook_response_guard(
+	target: crate::types::agent::SimpleBackendReference,
+	action: RejectAuditAction,
+) -> ResponseGuard {
+	use crate::types::agent::SimpleBackendReferenceWithPolicies;
+	ResponseGuard {
+		rejection: RequestRejection {
+			body: Bytes::from_static(b"tool call rejected"),
+			status: ::http::StatusCode::FORBIDDEN,
+			headers: None,
+		},
+		scope: default_response_scope(),
+		kind: ResponseGuardKind::Webhook(Webhook {
+			target: SimpleBackendReferenceWithPolicies {
+				target: Arc::new(target),
+				policies: vec![],
+			},
+			headers: Default::default(),
+			forward_header_matches: vec![],
+			failure_mode: FailureMode::FailClosed,
+			action,
+		}),
+	}
+}
+
+/// A webhook guard opted into tool calls via `scope: [messages, toolInput]`.
+pub(crate) fn webhook_response_guard_inspecting_tool_calls(
+	target: crate::types::agent::SimpleBackendReference,
+	action: RejectAuditAction,
+) -> ResponseGuard {
+	let mut guard = webhook_response_guard(target, action);
+	guard.scope = vec![ContentScope::Messages, ContentScope::ToolInput];
+	guard
+}
+
+#[test]
+fn webhook_scope_validation() {
+	let mut guard = webhook_response_guard(
+		crate::types::agent::SimpleBackendReference::Invalid,
+		RejectAuditAction::Reject,
+	);
+	// Default scope ([messages]) is valid.
+	guard.validate_scope().unwrap();
+	// messages + toolInput is the supported opt-in combination, in either order.
+	guard.scope = vec![ContentScope::Messages, ContentScope::ToolInput];
+	guard.validate_scope().unwrap();
+	guard.scope = vec![ContentScope::ToolInput, ContentScope::Messages];
+	guard.validate_scope().unwrap();
+	// Webhooks always receive message text, so a scope without `messages` would misdescribe
+	// the payload.
+	guard.scope = vec![ContentScope::ToolInput];
+	guard.validate_scope().unwrap_err();
+	// Tool outputs and prompts are not inspectable by webhooks.
+	guard.scope = vec![ContentScope::Messages, ContentScope::ToolOutput];
+	guard.validate_scope().unwrap_err();
+	guard.scope = vec![ContentScope::SystemPrompt];
+	guard.validate_scope().unwrap_err();
+
+	// Only webhooks have a restricted scope; every other guard kind walks any scoped
+	// response text.
+	let mut model_armor = webhook_response_guard(
+		crate::types::agent::SimpleBackendReference::Invalid,
+		RejectAuditAction::Reject,
+	);
+	model_armor.kind = ResponseGuardKind::GoogleModelArmor(GoogleModelArmor {
+		failure_mode: Default::default(),
+		template_id: "template".into(),
+		project_id: "project".into(),
+		location: None,
+		action: Default::default(),
+		policies: vec![],
+	});
+	model_armor.validate_scope().unwrap();
+	model_armor.scope = vec![ContentScope::Messages, ContentScope::ToolInput];
+	model_armor.validate_scope().unwrap();
+}
+
+/// Text-inspecting guards (Azure Content Safety, Model Armor) get the legacy text-only
+/// view: message texts are unchanged and tool calls are never flattened into their payloads.
+#[test]
+fn choice_texts_reflect_message_text_only() {
+	let mut resp = bash_completion("hello", "ls");
+	let (texts, _) = Policy::scoped_response_texts(&mut resp, &[ContentScope::Messages]);
+	assert_eq!(texts, vec!["hello".to_string()]);
+}
+
+/// Start a webhook server answering every `/response` call with `verdict`. Keep the returned
+/// server alive for as long as the guard is used.
+pub(crate) async fn webhook_response_server(
+	verdict: serde_json::Value,
+) -> (
+	wiremock::MockServer,
+	crate::types::agent::SimpleBackendReference,
+) {
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/response"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(verdict))
+		.mount(&server)
+		.await;
+	let target = crate::types::agent::SimpleBackendReference::InlineBackend(
+		crate::types::agent::Target::Address(*server.address()),
+	);
+	(server, target)
+}
+
+/// A webhook that masks the text of every choice and echoes tool calls unchanged, as a webhook
+/// server written against the documented payload would.
+async fn masking_webhook_server() -> (
+	wiremock::MockServer,
+	crate::types::agent::SimpleBackendReference,
+) {
+	use wiremock::matchers::{method, path};
+	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/response"))
+		.respond_with(|request: &wiremock::Request| {
+			let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+			let choices: Vec<serde_json::Value> = body["body"]["choices"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|choice| {
+					let mut choice = choice.clone();
+					if choice["message"]["content"] != "" {
+						choice["message"]["content"] = serde_json::json!("MASKED");
+					}
+					choice
+				})
+				.collect();
+			ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"action": {"reason": "masked", "body": {"choices": choices}}
+			}))
+		})
+		.mount(&server)
+		.await;
+	let target = crate::types::agent::SimpleBackendReference::InlineBackend(
+		crate::types::agent::Target::Address(*server.address()),
+	);
+	(server, target)
+}
+
+/// Every non-streaming response format reaches a scope-opted webhook with its tool calls; a
+/// mask rewrites only the message text, the tool calls pass through, and a reject verdict
+/// rejects the response.
+#[tokio::test]
+async fn non_streaming_webhook_guard_sees_tool_calls_in_every_format() {
+	use serde_json::json;
+
+	use crate::llm::types;
+
+	let completions = || -> Box<dyn ResponseType> {
+		Box::new(
+			serde_json::from_value::<types::completions::Response>(json!({
+				"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4",
+				"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+					"role": "assistant", "content": "Running it",
+					"tool_calls": [{"id": "call_1", "type": "function",
+						"function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}]
+				}}]
+			}))
+			.unwrap(),
+		)
+	};
+	let messages = || -> Box<dyn ResponseType> {
+		Box::new(
+			serde_json::from_value::<types::messages::Response>(json!({
+				"id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+				"content": [
+					{"type": "text", "text": "Running it"},
+					{"type": "tool_use", "id": "call_1", "name": "bash", "input": {"cmd": "ls"}}
+				],
+				"stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}
+			}))
+			.unwrap(),
+		)
+	};
+	let responses = || -> Box<dyn ResponseType> {
+		Box::new(
+			serde_json::from_value::<types::responses::Response>(json!({
+				"id": "resp_1", "status": "completed", "model": "gpt-5", "output": [
+					{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+						"content": [{"type": "output_text", "text": "Running it", "annotations": []}]},
+					{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "bash",
+						"arguments": "{\"cmd\":\"ls\"}", "status": "completed"}
+				]
+			}))
+			.unwrap(),
+		)
+	};
+	let gemini = || -> Box<dyn ResponseType> {
+		Box::new(
+			serde_json::from_value::<types::gemini::Response>(json!({
+				"candidates": [{"content": {"role": "model", "parts": [
+					{"text": "Running it"},
+					{"functionCall": {"id": "call_1", "name": "bash", "args": {"cmd": "ls"}}}
+				]}, "finishReason": "STOP"}]
+			}))
+			.unwrap(),
+		)
+	};
+	type MakeResponse = dyn Fn() -> Box<dyn ResponseType>;
+	let formats: [(&str, &MakeResponse); 4] = [
+		("completions", &completions),
+		("messages", &messages),
+		("responses", &responses),
+		("gemini", &gemini),
+	];
+
+	for (format, make) in formats {
+		let client = crate::test_helpers::policy_client();
+		let headers = ::http::HeaderMap::new();
+
+		// Mask: the payload carries the tool call, only the text is rewritten.
+		let (server, target) = masking_webhook_server().await;
+		let guards = vec![webhook_response_guard_inspecting_tool_calls(
+			target,
+			RejectAuditAction::Reject,
+		)];
+		let mut resp = make();
+		let rejection =
+			Policy::apply_response_prompt_guard(&client, resp.as_mut(), &headers, &guards, None, None)
+				.await
+				.unwrap();
+		assert!(rejection.is_none(), "{format}: an unchanged echo is a mask");
+		let request: serde_json::Value =
+			serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+		let tool_calls: Vec<&serde_json::Value> = request["body"]["choices"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.filter_map(|choice| choice.get("tool_calls"))
+			.flat_map(|calls| calls.as_array().unwrap())
+			.collect();
+		assert_eq!(tool_calls.len(), 1, "{format}: {request}");
+		assert_eq!(tool_calls[0]["id"], "call_1", "{format}");
+		assert_eq!(tool_calls[0]["name"], "bash", "{format}");
+		assert_eq!(tool_calls[0]["arguments"], json!({"cmd": "ls"}), "{format}");
+		let out = String::from_utf8(resp.serialize().unwrap()).unwrap();
+		assert!(out.contains("MASKED"), "{format}: {out}");
+		assert!(!out.contains("Running it"), "{format}: {out}");
+		assert!(
+			out.contains("bash") && out.contains("ls"),
+			"{format}: {out}"
+		);
+
+		// Reject: the response is rejected with the guard's configured rejection.
+		let (_server, target) = webhook_response_server(json!({
+			"action": {"body": "no bash", "status_code": 403, "reason": "dangerous tool"}
+		}))
+		.await;
+		let guards = vec![webhook_response_guard_inspecting_tool_calls(
+			target,
+			RejectAuditAction::Reject,
+		)];
+		let mut resp = make();
+		let rejection =
+			Policy::apply_response_prompt_guard(&client, resp.as_mut(), &headers, &guards, None, None)
+				.await
+				.unwrap()
+				.unwrap_or_else(|| panic!("{format}: a reject verdict rejects"));
+		assert_eq!(
+			rejection.status(),
+			::http::StatusCode::FORBIDDEN,
+			"{format}"
+		);
+	}
+}
+
+/// A response with text and a dangerous tool call, run through a webhook guard whose server
+/// answers with `verdict`.
+async fn webhook_tool_call_verdict(
+	verdict: serde_json::Value,
+	streaming: bool,
+) -> (
+	GuardrailAction,
+	Option<Response>,
+	crate::llm::types::completions::Response,
+) {
+	let (_server, target) = webhook_response_server(verdict).await;
+	let guard = webhook_response_guard_inspecting_tool_calls(target, RejectAuditAction::Reject);
+	let client = crate::test_helpers::policy_client();
+	let mut resp = bash_completion("Running it", "rm -rf /");
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&::http::HeaderMap::new(),
+		&client,
+		None,
+		None,
+		streaming,
+	)
+	.await
+	.unwrap();
+	(action, rejection, resp)
+}
+
+/// A Mask verdict that masks the text and returns `tool_calls` (omitted when `None`).
+fn mask_verdict(tool_calls: Option<serde_json::Value>) -> serde_json::Value {
+	let mut choice = serde_json::json!({
+		"message": { "role": "assistant", "content": "Running <masked>" }
+	});
+	if let Some(tool_calls) = tool_calls {
+		choice["tool_calls"] = tool_calls;
+	}
+	serde_json::json!({
+		"action": { "reason": "neutralize", "body": { "choices": [choice] } }
+	})
+}
+
+/// Tool calls cannot be rewritten, so a Mask that changes them must reject rather than mask
+/// the text alone and let the original call through.
+#[tokio::test]
+async fn webhook_mask_that_alters_tool_calls_rejects() {
+	for (case, tool_calls) in [
+		(
+			"rewritten",
+			serde_json::json!([{ "id": "call_1", "name": "bash", "arguments": { "cmd": "ls" } }]),
+		),
+		("dropped", serde_json::json!([])),
+		// Extra fields and a missing id must still parse as a Mask, not fall through to Pass.
+		(
+			"loosely shaped",
+			serde_json::json!([{ "type": "function", "name": "bash", "arguments": { "cmd": "ls" } }]),
+		),
+	] {
+		for streaming in [true, false] {
+			let (action, rejection, _) =
+				webhook_tool_call_verdict(mask_verdict(Some(tool_calls.clone())), streaming).await;
+			assert_eq!(
+				action,
+				GuardrailAction::Reject,
+				"{case}, streaming={streaming}"
+			);
+			let rejection = rejection.unwrap_or_else(|| panic!("{case}, streaming={streaming}"));
+			assert_eq!(rejection.status(), ::http::StatusCode::FORBIDDEN);
+		}
+	}
+}
+
+#[tokio::test]
+async fn webhook_mask_that_keeps_tool_calls_is_not_rejected() {
+	for (case, tool_calls) in [
+		// Webhooks written before tool calls were sent never echo them.
+		("omitted", None),
+		(
+			"echoed",
+			Some(
+				serde_json::json!([{ "id": "call_1", "name": "bash", "arguments": { "cmd": "rm -rf /" } }]),
+			),
+		),
+		(
+			"echoed with stringified arguments",
+			Some(serde_json::json!([{
+				"id": "call_1", "type": "function", "name": "bash", "arguments": "{\"cmd\": \"rm -rf /\"}"
+			}])),
+		),
+		(
+			"echoed without id",
+			Some(serde_json::json!([{ "name": "bash", "arguments": { "cmd": "rm -rf /" } }])),
+		),
+	] {
+		let (action, rejection, resp) =
+			webhook_tool_call_verdict(mask_verdict(tool_calls.clone()), false).await;
+		assert_eq!(action, GuardrailAction::Mask, "{case}");
+		assert!(rejection.is_none(), "{case}");
+		assert_bash_completion(&resp, "Running <masked>", "rm -rf /", case);
+
+		// Streaming cannot apply a mask; that is unchanged.
+		let (action, rejection, _) = webhook_tool_call_verdict(mask_verdict(tool_calls), true).await;
+		assert_eq!(action, GuardrailAction::Allow, "{case}");
+		assert!(rejection.is_none(), "{case}");
+	}
+}
+
+#[test]
+fn echoed_tool_call_arguments_compare_semantically() {
+	use serde_json::json;
+	let sent = json!({"cmd": "ls", "id": 12345678901234567890u64, "ratio": 1});
+	// JavaScript webhooks round integers above 2^53; others may print 1 as 1.0.
+	assert!(echoed_arguments_match(
+		&sent,
+		&json!({"cmd": "ls", "id": 12345678901234567000u64, "ratio": 1.0})
+	));
+	// OpenAI-style stringified echoes are compared by value.
+	assert!(echoed_arguments_match(&sent, &json!(sent.to_string())));
+	// A string payload echoed as-is is unchanged, even when it is itself valid JSON.
+	assert!(echoed_arguments_match(&json!("{}"), &json!("{}")));
+
+	assert!(!echoed_arguments_match(
+		&sent,
+		&json!({"cmd": "rm -rf /", "id": 12345678901234567890u64, "ratio": 1})
+	));
+	assert!(!echoed_arguments_match(&sent, &json!({"cmd": "ls"})));
+	assert!(!echoed_arguments_match(&sent, &json!("not the arguments")));
+}
+
+/// A webhook guard with the default scope gets the legacy payload: same choices, no
+/// tool_calls field. Masking still works and the tool calls pass through untouched.
+#[tokio::test]
+async fn webhook_with_default_scope_receives_no_tool_calls() {
+	let (server, target) = webhook_response_server(mask_verdict(None)).await;
+	let guard = webhook_response_guard(target, RejectAuditAction::Reject);
+	let client = crate::test_helpers::policy_client();
+	let mut resp = bash_completion("Running it", "rm -rf /");
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&::http::HeaderMap::new(),
+		&client,
+		None,
+		None,
+		false,
+	)
+	.await
+	.unwrap();
+	assert_eq!(action, GuardrailAction::Mask);
+	assert!(rejection.is_none());
+	assert_bash_completion(&resp, "Running <masked>", "rm -rf /", "default scope");
+
+	let requests = server.received_requests().await.unwrap();
+	assert_eq!(requests.len(), 1);
+	let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+	let choice = &body["body"]["choices"][0];
+	assert_eq!(choice["message"]["content"], "Running it");
+	assert!(
+		choice.get("tool_calls").is_none(),
+		"default-scope webhook must not receive tool calls: {body}"
+	);
+}
+
+/// A webhook that was never sent tool calls cannot meaningfully alter them: a Mask that
+/// echoes or invents tool calls (under the default scope) is applied to the text only,
+/// exactly as before the tool_calls field existed — echoed fields were silently ignored
+/// by the old parser, so they must not cause a rejection now.
+#[tokio::test]
+async fn webhook_mask_with_unsent_tool_calls_ignores_echoed_tool_calls() {
+	for (case, tool_calls) in [
+		(
+			"rewritten",
+			serde_json::json!([{ "id": "call_1", "name": "bash", "arguments": { "cmd": "ls" } }]),
+		),
+		("dropped", serde_json::json!([])),
+		(
+			"loosely shaped",
+			serde_json::json!([{ "type": "function", "name": "bash", "arguments": { "cmd": "ls" } }]),
+		),
+	] {
+		let (_server, target) = webhook_response_server(mask_verdict(Some(tool_calls.clone()))).await;
+		let guard = webhook_response_guard(target, RejectAuditAction::Reject);
+		let client = crate::test_helpers::policy_client();
+		let mut resp = bash_completion("Running it", "rm -rf /");
+		let (action, rejection) = Policy::apply_single_response_guard(
+			&guard,
+			&mut resp,
+			&::http::HeaderMap::new(),
+			&client,
+			None,
+			None,
+			false,
+		)
+		.await
+		.unwrap();
+		assert_eq!(action, GuardrailAction::Mask, "{case}");
+		assert!(rejection.is_none(), "{case}");
+		assert_bash_completion(&resp, "Running <masked>", "rm -rf /", case);
+	}
+}
+
+#[tokio::test]
+async fn webhook_audit_reports_tool_call_mask_as_would_reject() {
+	let (_server, target) = webhook_response_server(mask_verdict(Some(serde_json::json!([])))).await;
+	let guard = webhook_response_guard_inspecting_tool_calls(target, RejectAuditAction::Audit);
+	let client = crate::test_helpers::policy_client();
+	let mut resp = bash_completion("Running it", "rm -rf /");
+	let (outcome, detail) = Policy::evaluate_single_response_guard(
+		&guard,
+		&mut resp,
+		&::http::HeaderMap::new(),
+		&client,
+		None,
+	)
+	.await
+	.unwrap();
+	assert!(matches!(outcome, GuardrailOutcome::Audit));
+	assert_eq!(detail.unwrap().assessments[0]["wouldAction"], "reject");
+}

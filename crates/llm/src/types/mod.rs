@@ -89,10 +89,18 @@ pub(crate) fn anthropic_effort_for_thinking_budget(budget: u64) -> messages::typ
 /// uniform policy enforcement and observability
 pub trait ResponseType: Send + Sync {
 	fn to_llm_response(&self, log_content: crate::LogContentFields) -> LLMResponse;
-	fn to_webhook_choices(&self) -> Vec<crate::webhook::ResponseChoice>;
+	/// Map the response into webhook choices. `include_tool_calls` controls whether tool
+	/// calls are surfaced: when false, the mapping is the legacy text-only shape — same
+	/// choices, same count, `tool_calls` never set — so consumers that cannot handle tool
+	/// calls see exactly the payload they always have.
+	fn to_webhook_choices(&self, include_tool_calls: bool) -> Vec<crate::webhook::ResponseChoice>;
+	/// Write (possibly masked) webhook choices back into the response. `include_tool_calls`
+	/// must match the `to_webhook_choices` call the choices answer, so they line up with the
+	/// same items; only message text is written back.
 	fn set_webhook_choices(
 		&mut self,
 		resp: Vec<crate::webhook::ResponseChoice>,
+		include_tool_calls: bool,
 	) -> anyhow::Result<()>;
 	fn serialize(&self) -> serde_json::Result<Vec<u8>>;
 	fn visit_text_mut(&mut self, f: &mut dyn FnMut(ResponseText, &mut String));
@@ -506,6 +514,9 @@ pub(crate) fn attach_tool_result_names(messages: &mut [NormalizedMessage]) {
 }
 
 /// ToolCall represents a single tool/function invocation surfaced for observability.
+// Also the `tool_calls` entry of guardrail webhook payloads (`webhook::ResponseChoice`): its
+// serialized shape is part of the webhook API, pinned by
+// `webhook::tests::response_choice_wire_format`.
 #[apply(schema!)]
 #[derive(cel::DynamicType)]
 pub struct ToolCall {
@@ -513,6 +524,17 @@ pub struct ToolCall {
 	pub name: Strng,
 	#[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
 	pub arguments: serde_json::Value,
+}
+
+/// Chat completions and the Responses API serialize tool-call arguments as a stringified
+/// JSON payload. Parse them into JSON, converting an empty payload to an empty object and
+/// preserving an invalid payload as a JSON string rather than dropping it.
+pub fn parse_tool_call_arguments(raw: &str) -> serde_json::Value {
+	match serde_json::from_str(raw) {
+		Ok(arguments) => arguments,
+		Err(_) if raw.trim().is_empty() => serde_json::Value::Object(Default::default()),
+		Err(_) => serde_json::Value::String(raw.to_owned()),
+	}
 }
 
 /// A single content part within an output message, per the GenAI semantic conventions.
