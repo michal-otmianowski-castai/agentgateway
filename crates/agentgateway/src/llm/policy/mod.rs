@@ -2603,6 +2603,11 @@ pub struct ResponseGuard {
 	#[serde(default)]
 	pub rejection: RequestRejection,
 	/// Which parts of the response this guard inspects.
+	/// Webhook guards accept `[messages, toolInput]`: the webhook then also receives the model's
+	/// tool calls (`tool_calls` on each choice) for inspection. Webhooks cannot rewrite tool
+	/// calls; to block one, reject the response. `toolInput` is not supported on streamed
+	/// responses: streamed response guards only support `[messages]`. Realtime connections do
+	/// not send tool calls to webhooks.
 	#[serde(
 		default = "default_response_scope",
 		deserialize_with = "de_response_scope"

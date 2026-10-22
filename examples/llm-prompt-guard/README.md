@@ -201,3 +201,45 @@ policies:
             x-user: jwt.sub
             x-tenant: request.headers["x-tenant"]
 ```
+
+#### Inspecting tool calls
+
+By default, response webhooks receive only message text. To also audit or block the
+tool calls the model makes, opt in with `scope: [messages, toolInput]`:
+
+```yaml
+policies:
+  ai:
+    promptGuard:
+      response:
+      - webhook:
+          target:
+            host: 127.0.0.1:8000
+        scope: [messages, toolInput]
+```
+
+Each choice in the `POST /response` body then carries its tool calls, with arguments
+parsed to JSON:
+
+```json
+{
+  "body": {
+    "choices": [{
+      "message": {"role": "assistant", "content": "Listing the files."},
+      "tool_calls": [{"id": "call_1", "name": "bash", "arguments": {"cmd": "ls"}}]
+    }]
+  }
+}
+```
+
+- Function and custom tools are named as declared. Built-in tools are surfaced too, without
+  their results: OpenAI Responses tools (`shell_call`, `apply_patch_call`, `mcp_call`, ...)
+  are named by their item type and carry the item as `arguments`; Gemini code execution is
+  named `executableCode` and other Gemini built-ins by their tool type (e.g.
+  `GOOGLE_SEARCH_WEB`).
+- Tool calls cannot be rewritten. A `mask` action rewrites `message.content` only; it may
+  omit `tool_calls` or echo them, but changing them rejects the response. To block a tool
+  call, return a `reject` action.
+- `toolInput` is not supported on streamed responses yet: with `streaming: Enabled`,
+  response guards only support the `messages` scope.
+- Realtime (websocket) connections do not send tool calls to webhooks.

@@ -6083,7 +6083,7 @@
           }
         },
         "scope": {
-          "description": "Which parts of the response this guard inspects.",
+          "description": "Which parts of the response this guard inspects.\nWebhook guards accept `[messages, toolInput]`: the webhook then also receives the model's\ntool calls (`tool_calls` on each choice) for inspection. Webhooks cannot rewrite tool\ncalls; to block one, reject the response. `toolInput` is not supported on streamed\nresponses: streamed response guards only support `[messages]`. Realtime connections do\nnot send tool calls to webhooks.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/ContentScope"

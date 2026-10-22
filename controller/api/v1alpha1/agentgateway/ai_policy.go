@@ -364,6 +364,11 @@ type PromptguardResponse struct {
 	// In APIs that send tool arguments as opaque JSON, such as Completions, the
 	// arguments are masked as a single string, meaning a prompt guard has the
 	// potential to rewrite the arguments into invalid JSON.
+	// Webhook guards accept `[Messages, ToolInput]`: the webhook then also receives
+	// the model's tool calls (`tool_calls` on each choice) for inspection. Webhooks
+	// cannot rewrite tool calls; to block one, reject the response. `ToolInput` is not
+	// supported on streamed responses: streamed response guards only support
+	// `[Messages]`.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=4
 	// +listType=set

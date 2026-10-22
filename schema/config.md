@@ -10115,4 +10115,4 @@ These types are used by many fields. Fields of these types link here instead of 
 |`<Guardrails>.response[].rejection.headers.add`|object|Headers to append without replacing existing values.|
 |`<Guardrails>.response[].rejection.headers.set`|object|Headers to set, replacing any existing values.|
 |`<Guardrails>.response[].rejection.headers.remove`|[]string|Header names to remove.|
-|`<Guardrails>.response[].scope`|[]enum|Which parts of the response this guard inspects.<br>Possible values: `systemPrompt`, `messages`, `toolOutput`, `toolInput`.|
+|`<Guardrails>.response[].scope`|[]enum|Which parts of the response this guard inspects.<br>Webhook guards accept `[messages, toolInput]`: the webhook then also receives the model's<br>tool calls (`tool_calls` on each choice) for inspection. Webhooks cannot rewrite tool<br>calls; to block one, reject the response. `toolInput` is not supported on streamed<br>responses: streamed response guards only support `[messages]`. Realtime connections do<br>not send tool calls to webhooks.<br>Possible values: `systemPrompt`, `messages`, `toolOutput`, `toolInput`.|
