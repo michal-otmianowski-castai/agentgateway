@@ -865,7 +865,7 @@ mod responses {
 		let info = Arc::new(Mutex::new(LLMInfo::new(
 			LLMRequest {
 				input_tokens: None,
-				input_format: InputFormat::Detect,
+				input_format: InputFormat::Detect(None),
 				cache_convention: CacheTokenConvention::pending(),
 				request_model: strng::literal!("input-model"),
 				provider: Default::default(),
@@ -1081,6 +1081,7 @@ mod responses {
 	const BEDROCK_STREAM_RESPONSES: &[(&str, &[&str])] = &[
 		("basic", ALL_BEDROCK),
 		("tool", ALL_BEDROCK),
+		("tool_no_args", ALL_BEDROCK),
 		("reasoning", ALL_BEDROCK),
 		("reasoning_redacted", ALL_BEDROCK),
 	];
@@ -1864,7 +1865,7 @@ data: {"type":"message_stop"}
 		let info = Arc::new(Mutex::new(LLMInfo::new(
 			LLMRequest {
 				input_tokens: None,
-				input_format: InputFormat::Detect,
+				input_format: InputFormat::Detect(None),
 				cache_convention: CacheTokenConvention::pending(),
 				request_model: strng::literal!("input-model"),
 				provider: Default::default(),
@@ -1899,7 +1900,7 @@ data: {"type":"message_stop"}
 		let info = Arc::new(Mutex::new(LLMInfo::new(
 			LLMRequest {
 				input_tokens: None,
-				input_format: InputFormat::Detect,
+				input_format: InputFormat::Detect(None),
 				cache_convention: CacheTokenConvention::pending(),
 				request_model: strng::literal!("input-model"),
 				provider: Default::default(),

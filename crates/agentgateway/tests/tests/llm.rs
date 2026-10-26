@@ -102,6 +102,125 @@ async fn llm_openai_tokenize() {
 	assert_llm(io, llm_body!("requests/completions/basic.json"), want).await;
 }
 
+const GEMINI_SIGNATURE: &str = "opaque-thought-signature";
+const GEMINI_SIGNATURE_CARRIER_PREFIX: &str = "agentgateway.gemini.thought-signature.v1:";
+
+fn gemini_signature_carrier() -> String {
+	format!(
+		"{GEMINI_SIGNATURE_CARRIER_PREFIX}{}",
+		json!({"call_id": "call_1", "signature": GEMINI_SIGNATURE})
+	)
+}
+
+// A client replays the assistant turn it received from a Gemini-backed route. Only Gemini
+// understands the signature, so every other provider must get a request without it.
+fn gemini_signature_replay(api: &str, model: &str) -> (&'static str, Value) {
+	let carrier = gemini_signature_carrier();
+	match api {
+		"messages" => (
+			"/v1/messages",
+			json!({
+				"model": model,
+				"max_tokens": 64,
+				"messages": [
+					{"role": "user", "content": "What is the weather?"},
+					{"role": "assistant", "content": [
+						{"type": "thinking", "thinking": "", "signature": carrier},
+						{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}
+					]},
+					{"role": "user", "content": [
+						{"type": "tool_result", "tool_use_id": "call_1", "content": "sunny"}
+					]}
+				]
+			}),
+		),
+		"responses" => (
+			"/v1/responses",
+			json!({
+				"model": model,
+				"input": [
+					{"role": "user", "content": "What is the weather?"},
+					{"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": carrier},
+					{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+					{"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+				]
+			}),
+		),
+		_ => unreachable!("unknown client API {api}"),
+	}
+}
+
+#[rstest::rstest]
+#[case::messages_to_openai("messages", false)]
+#[case::responses_to_gemini("responses", true)]
+#[tokio::test]
+async fn llm_gemini_thought_signature_follows_provider(#[case] api: &str, #[case] is_gemini: bool) {
+	let mock = body_mock(llm_body!("response/completions/basic.json")).await;
+	let provider = if is_gemini {
+		AIProvider::Gemini(gemini::Provider {
+			model_override: None,
+		})
+	} else {
+		AIProvider::OpenAI(openai::Provider {
+			model_override: None,
+			moderation: None,
+		})
+	};
+	let (mock, mut bind, io) = setup_llm_mock(mock, provider, false, "{}");
+	bind
+		.attach_route_policy(json!({
+			"ai": {
+				"routes": {
+					"/v1/messages": "messages",
+					"/v1/responses": "responses"
+				}
+			}
+		}))
+		.await;
+	let model = if is_gemini {
+		"gemini-3.8-flash"
+	} else {
+		"gpt-4o"
+	};
+	let (path, body) = gemini_signature_replay(api, model);
+
+	let res = send_request_body(
+		io,
+		Method::POST,
+		&format!("http://lo{path}"),
+		body.to_string().as_bytes(),
+	)
+	.await;
+	// The canned upstream response may not match the format the request was translated to;
+	// only the upstream request matters here.
+	let _ = read_body_raw(res.into_body()).await;
+
+	let request = single_upstream_request(&mock).await;
+	let upstream = serde_json::from_slice::<Value>(&request.body).unwrap();
+	let upstream_text = upstream.to_string();
+	assert!(
+		!upstream_text.contains(GEMINI_SIGNATURE_CARRIER_PREFIX),
+		"carrier leaked upstream: {upstream_text}"
+	);
+	if is_gemini {
+		let tool_call = upstream["messages"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.find_map(|message| message["tool_calls"].get(0))
+			.unwrap_or_else(|| panic!("no replayed tool call: {upstream_text}"));
+		assert_eq!(
+			tool_call["extra_content"]["google"]["thought_signature"],
+			GEMINI_SIGNATURE
+		);
+	} else {
+		assert!(
+			!upstream_text.contains(GEMINI_SIGNATURE) && !upstream_text.contains("extra_content"),
+			"signature leaked upstream: {upstream_text}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn llm_token_budget_persists_and_blocks_requests() {
 	let pool =
@@ -267,7 +386,7 @@ async fn llm_detect_mode_passthrough_without_rewrite() {
 	.await
 	.unwrap();
 	let want = json!({
-		"gen_ai.operation.name": "unknown",
+		"gen_ai.operation.name": "chat",
 		"gen_ai.provider.name": "openai",
 		"gen_ai.request.model": "replaceme",
 		"gen_ai.response.model": "gpt-3.5-turbo-0125",
@@ -330,7 +449,7 @@ async fn llm_detect_mode_respects_model_rewrite() {
 	.await
 	.unwrap();
 	let want = json!({
-		"gen_ai.operation.name": "unknown",
+		"gen_ai.operation.name": "chat",
 		"gen_ai.provider.name": "openai",
 		"gen_ai.request.model": "replaceme-overwrite",
 		"gen_ai.response.model": "gpt-3.5-turbo-0125",
@@ -901,8 +1020,10 @@ async fn llm_model_router_handles_multipart_audio_detect_request() {
 llm:
   port: 0
   models:
-  - name: real-model
+  - name: openai/*
     provider: openAI
+    transformation:
+      model: llmRequest.model.stripPrefix("openai/")
     params:
       baseUrl: http://{}/v1
     passthrough: detect
@@ -911,7 +1032,7 @@ llm:
 	);
 	let t = setup_local_llm_config(&config).await;
 	let io = t.serve_http(strng::literal!("bind/0"));
-	let body = multipart_audio_body("real-model");
+	let body = multipart_audio_body("openai/audio-model");
 
 	let res = send_multipart_audio(io.clone(), body.clone()).await;
 	assert_eq!(res.status(), StatusCode::OK);
@@ -922,12 +1043,12 @@ llm:
 		&request.url[Position::BeforePath..Position::AfterPath],
 		"/v1/audio/transcriptions"
 	);
-	assert_eq!(request.body, body);
+	assert_multipart_audio_body(&request.body, "audio-model").await;
 
 	let log = agent_core::telemetry::testing::eventually_find(&[
 		("scope", "request"),
 		("http.path", "/v1/audio/transcriptions"),
-		("gen_ai.provider.name", "openai"),
+		("gen_ai.request.model", "audio-model"),
 	])
 	.await
 	.unwrap();
@@ -936,6 +1057,61 @@ llm:
 		"gen_ai.response.model": "gpt-3.5-turbo-0125",
 		"gen_ai.usage.input_tokens": 17,
 		"gen_ai.usage.output_tokens": 23
+	});
+	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
+}
+
+#[tokio::test]
+async fn llm_detect_reads_usage_from_unrequested_event_stream() {
+	// The client did not set `stream`, so only the response content type marks this as a stream.
+	let mock = MockServer::start().await;
+	Mock::given(wiremock::matchers::path_regex("/.*"))
+		.respond_with(ResponseTemplate::new(StatusCode::OK.as_u16()).set_body_raw(
+			concat!(
+				"data: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"AAAA\"}\n\n",
+				"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"AAAA\",\"usage\":{",
+				"\"input_tokens\":14,\"output_tokens\":45,\"total_tokens\":59,",
+				"\"input_tokens_details\":{\"text_tokens\":14,\"image_tokens\":0}}}\n\n",
+			),
+			"text/event-stream",
+		))
+		.mount(&mock)
+		.await;
+	let config = format!(
+		r#"
+llm:
+  port: 0
+  models:
+  - name: stream-model
+    provider: openAI
+    params:
+      baseUrl: http://{}/v1
+"#,
+		mock.address()
+	);
+	let t = setup_local_llm_config(&config).await;
+	let io = t.serve_http(strng::literal!("bind/0"));
+
+	let res = RequestBuilder::new(Method::POST, "http://lo/v1/images/generations")
+		.header(header::CONTENT_TYPE, "application/json")
+		.body(Body::from(r#"{"model":"stream-model","prompt":"a cat"}"#))
+		.send(io)
+		.await
+		.expect("image generation request");
+	assert_eq!(res.status(), StatusCode::OK);
+	let _ = read_body_raw(res.into_body()).await;
+
+	let log = agent_core::telemetry::testing::eventually_find(&[
+		("scope", "request"),
+		("http.path", "/v1/images/generations"),
+		("gen_ai.request.model", "stream-model"),
+	])
+	.await
+	.unwrap();
+	let want = json!({
+		"gen_ai.operation.name": "image_generation",
+		"gen_ai.usage.input_tokens": 14,
+		"gen_ai.usage.output_tokens": 45
 	});
 	assert!(is_json_subset(&want, &log), "want={want:#?} got={log:#?}");
 }

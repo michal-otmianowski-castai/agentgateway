@@ -355,10 +355,10 @@ impl SubstrateIngress {
 					let mut span = client.start_grpc_span(
 						&mut request,
 						self.target.target.as_ref(),
-						"/ateapi.Control/ResumeActor",
+						"/substrate.ateapi.v1.Control/ResumeActor",
 					);
 					if let Some(span) = span.as_deref_mut() {
-						span.rename_span("ateapi.Control/ResumeActor");
+						span.rename_span("substrate.ateapi.v1.Control/ResumeActor");
 					}
 					let response = dtrace::scope_future(
 						Some(TRACE_POLICY_KIND),
@@ -689,10 +689,8 @@ impl RequestPolicyTrait for SubstrateIngress {
 	) -> Result<PolicyResponse, crate::proxy::ProxyResponse> {
 		let connect_authority = req
 			.extensions()
-			.get::<crate::cel::SourceContext>()
-			.and_then(|source| single_header(&source.connect_headers, ::http::header::HOST.as_str()));
-		// We detect whether this was from the connect tunnel based on whether there's
-		// a CONNECT authority in source context.
+			.get::<crate::transport::stream::ConnectAuthority>()
+			.map(|authority| authority.0.as_str());
 		let from_connect_tunnel = connect_authority.is_some();
 		// The application request authority is forwarded unchanged. Its port only
 		// selects an actor port for CONNECT traffic; regular HTTP addresses port 80.
